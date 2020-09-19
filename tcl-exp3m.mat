@@ -1,0 +1,416 @@
+%%% Thesis: Learning the Signal Response of Thermostatically controlled Loads
+% Amr Mohamed, March 2017
+% This matlab code entails the algorithm proposed to model a 
+% population of TCLs and dispatch them for demand response in successive
+% rounds while using Exp3.M to learn their
+% signal response and select the best TCLs to follow the signal.
+% The code requires the installation of cvx with a commercial solver such
+% as gurobi or other equivalent tools.
+
+clear all; clc; clf
+
+live_results = 1; % allows the user to see TCL selection as they happen 
+%% Initialize TCL and algorithm parameters
+K = 6;     % no. of TCLs (actions)
+k = 2;      % no. of TCLs per round
+T = 10000;    % number of learning rounds
+h = 10;     % [sec] time-step for the convex optimization problem
+t_m = 6*h;   % [sec] machine learning time period
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+M = t_m/h; % no. of intervals h in tx
+
+% temperature vectors for TCLs
+temp_a = 40             *ones(M,1);             % ambient temperature
+t_delta = (0.25 - 0.05) *rand(K,1) + 0.05;      % [deg C] temperature deadband
+temp_l = (18 - 12)      *rand(K,1) + 12;        % [deg C] lowest desired temperature
+temp_i = (t_delta)      .*rand(K,1) + temp_l;    % initial TCL temperatures
+
+% TCL parameters for N TCLs
+C = (2.5 - 1.5) *rand(K,1) + 1.5;     % [kWh/deg C] TCL thermal capacitance vector
+R = (2.5 - 1.5) *rand(K,1) + 1.5;   % [deg C/kW] TCL thermal resistance vector
+Pr = (18 - 10)  *rand(K,1) + 10;  % [kW] TCL thermal power transfer coeeficient vector
+COP = (2.5)     *ones(K,1);         % TCL coefficient of Performance vector
+
+a = exp((-h/3600)./(R.*C));         % temperature control dependence vector
+
+%% Check if the convex optimization problem will be feasible for all TCLs
+fprintf('Check feasibility of cvx for each TCL:\n');
+for i = 1:K
+    if (temp_a(1) < temp_l(i) && ... 
+        (temp_l(i) + t_delta(i)) < temp_a(1) - R(i)*Pr(i) && ...
+        t_delta(i) < (1-a(i))*(temp_l(i) + t_delta(i) - temp_a(1) + R(i)*Pr(i)) && ...
+        t_delta(i) < (1-a(i))*(temp_a - temp_l(i)));
+       fprintf('Failed: TECL %d\n', i);
+       error('CVX optimization not feasible');
+    end
+end
+fprintf('Feasibility check confirmed.\n');
+
+%% EXP3.M
+% Initializations
+W = ones(K, T);         % arm weights per round
+wm = ones(K, 1);        % modified arm weights
+P = zeros(K, T);        % arms probabilites per round
+comm_L = zeros(1,T);    % commulative losses endured
+Lround = zeros(1,T);    % loss endured in each round: supposed to decrease
+tclCall = zeros(K,1);   % No of rounds each TCL was called
+tclCall_greedy = zeros(K,1);   % No of rounds each TCL was called: Greedy
+tclCall_best = zeros(K,1);   % No of rounds each TCL was called: Full information
+Lmin = zeros(1,T);      % Minimum loss to be endured in each round (commulative)
+min_loss = zeros(1, T); % Minimum loss to be endured in each round
+loss_greedy = zeros(K, 1);
+L_greedy = zeros(1, T);
+
+Smaxmax = (h/3600)*18/2.5; % Maximum energy consumption of all TCLs
+        
+% Rounds start here
+for t = 1:T
+    %% (1) Check the weights for each TCL to check if weight modification is required
+    temp_i = (t_delta).*rand(K,1) + temp_l;    % initial TCL temperatures
+    S = Smaxmax*rand(M,1);  % Consumption signal
+    
+    lr = min(1, sqrt(K*log(K/k)/((exp(1)-1)*k*T)));   % learning parameter
+    fprintf('Round |%d|: TCL ', t);
+    
+    alpha = 1e+3;
+    for i = 1:K
+        if (W(i,t) >= (((1/k)-(lr/K))/(1-lr))*sum(W(:,t)))
+            % (2) Decide alpha
+            w = sort(W(:,t));
+            
+            x = 1;
+            j = 1;
+            while (j <= K)
+                if (j == 1)
+                    x_alpha = w(j)/((K-j+1)*w(j));
+                else
+                    x_alpha = w(j)/((sum(w(1:j-1)))+((K-j+1)*w(j)));
+                end
+                
+                if (x_alpha > (((1/k)-(lr/K))/(1-lr)))
+                    j = j - 1;
+                    x = 0;
+                    break;
+                end
+                j = j + 1;
+            end
+            
+            alpha = w(j);
+            fprintf('\nalpha: %d\n', alpha);
+            if (x == 1)
+               error('x_alpha not found.'); 
+            end
+  
+            break; % Break (1)
+        end
+    end
+    
+    %% (3) Set S0
+    wm = ones(K,1);
+    S0 = [];
+    for i = 1:K
+        if (W(i, t) >= alpha)
+            wm(i) = alpha;
+            S0 = [S0 i];
+        else
+            wm(i) = W(i,t);
+        end
+    end
+    
+    %% (4) Set probabilities
+    for i = 1:K
+        P(i,t) = k*((1-lr)*wm(i)/sum(wm) + lr/K);
+    end
+    
+    %% (5) DepRound
+    pm = P(:, t);
+    bln = 0;
+    for i = 1:K
+        if (0 < (round(pm(i)*100)/100) && ...
+                (round(pm(i)*100)/100) < 1)
+            bln = 1;
+            break;
+        end
+    end
+    while (bln == 1)
+        x1 = 1; % Choosing distinct i and j
+        while (pm(x1) >= 1 || pm(x1) <= 0)
+            x1 = x1 + 1;
+        end
+        x2 = K;
+        while (pm(x2) >= 1 || pm(x2) <= 0)
+            x2 = x2 - 1;
+        end
+        
+        % Set alpha and beta
+        alpha_b = min(1 - pm(x1), pm(x2));
+        beta_b = min(pm(x1), 1 - pm(x2));
+        
+        pr = rand(1);
+        
+        % Update probabilites
+        if ( pr <= beta_b/(beta_b + alpha_b) )
+            pm(x1) = pm(x1) + alpha_b;
+            pm(x2) = pm(x2) - alpha_b;
+        else
+            pm(x1) = pm(x1) - beta_b;
+            pm(x2) = pm(x2) + beta_b;
+        end
+        
+        bln = 0;
+        for i = 1:K
+            if (0 < (round(pm(i)*100)/100) && ...
+                    (round(pm(i)*100)/100) < 1)
+                bln = 1;
+                break;
+            end
+        end     
+    end
+    
+    S1 = [];
+    for i = 1:K
+        if ((round(pm(i)*100)/100) == 1)
+            S1 = [S1 i];
+        end
+    end
+    
+    %% (6) Receive loss: cvx
+    loss = ones(K,1);
+    for z = 1:k
+        % Generate inputs for TCL Convex Optimization
+        x = S1(z); % TCL
+        fprintf('|%d| ', x);
+        tclCall(x) = tclCall(x) + 1;
+        
+        % generate vector A1        
+        A1 = zeros(1,M);
+        for i = 1:M
+            A1(i,i) = a(x)^i;
+        end
+        % generate matrix A2
+        A2 = zeros(M,M);
+        for i = 1:M
+            for y = 1:i
+                A2(i,y) = (a(x)^(i-y))*(1-a(x));
+            end
+        end
+        % generate matrix A3
+        A3 = zeros(M,M);
+        for i = 1:M
+            for y = 1:i
+                A3(i,y) = R(x)*Pr(x)*(a(x)^(i-y))*(a(x)-1);
+            end
+        end
+                
+        % generate setpoint (signal to track)
+        Smax = ((h/3600)*Pr(x)/COP(x)); 
+
+        cvx_begin quiet
+            variable y(M,1) integer
+            minimize(norm(S - Smax*y))
+            subject to
+                0 <= x <= 1;
+                temp_l(x) <= A1*(temp_i(x)*ones(M,1)) + A2*temp_a + A3*y <= temp_l(x)+t_delta(x);
+        cvx_end
+    
+        if (cvx_optval == Inf || rand(1,1) <= 0.01)
+            loss(x) = 1;
+        else
+            loss(x) = sum(abs(S - Smax*y))/(M*Smaxmax);
+        end 
+    end
+    
+    %% (7) Adjust weights and probabilites 
+    est_reward = (1-loss)./P(:,t);
+    
+    W(:, t+1) = W(:,t).*exp(k/K*lr*est_reward);
+    if (~isempty(S0))
+        for i = 1:length(S0)
+            W(i, t+1) = W(i,t);
+        end
+    end
+    W(:, t+1) = W(:, t+1)/max(W(:, t+1));
+    Lround(t) = sum(loss)-(K-k);
+    comm_L(t+1) = comm_L(t)+Lround(t);   
+    
+    %% (8) Estimate Regret
+    S2 = setdiff((1:K),S1);
+    for z = 1:(K-k)
+        % Generate inputs for TCL Convex Optimization
+        x = S2(z); % TCL
+        
+        % generate vector A1        
+        A1 = zeros(1,M);
+        for i = 1:M
+            A1(i,i) = a(x)^i;
+        end
+        % generate matrix A2
+        A2 = zeros(M,M);
+        for i = 1:M
+            for y = 1:i
+                A2(i,y) = (a(x)^(i-y))*(1-a(x));
+            end
+        end
+        % generate matrix A3
+        A3 = zeros(M,M);
+        for i = 1:M
+            for y = 1:i
+                A3(i,y) = R(x)*Pr(x)*(a(x)^(i-y))*(a(x)-1);
+            end
+        end
+                
+        % generate setpoint (signal to track)
+        Smax = ((h/3600)*Pr(x)/COP(x)); 
+
+        cvx_begin quiet
+            variable y(M,1) integer
+            minimize(norm(S - Smax*y))
+            subject to
+                0 <= x <= 1;
+                temp_l(x) <= A1*(temp_i(x)*ones(M,1)) + A2*temp_a + A3*y <= temp_l(x)+t_delta(x);
+        cvx_end
+    
+        if (cvx_optval == Inf || rand(1,1) <= 0.01)
+            loss(x) = 1;
+        else
+            loss(x) = sum(abs(S - Smax*y))/(M*Smaxmax);
+        end 
+    end
+    
+    loss_cmb = (combnk(loss, k))';
+    if (k == 1)
+        min_loss(t) = min(loss_cmb);
+    else
+        min_loss(t) = min(sum(loss_cmb));
+    end
+    Lmin(t+1) = Lmin(t) + min_loss(t);
+    
+    fprintf('\nGreedy:  TCL ');
+    %% Greedy algorithm
+    L_greedy(t+1) = L_greedy(t);
+    argmin = zeros(k,1);
+    clearvars argmin
+    for i = 1:k
+        [min, argmin(i)] = min(loss_greedy);
+        tclCall_greedy(argmin(i)) = tclCall_greedy(argmin(i)) + 1;
+        loss_greedy(argmin(i)) = 1.2;
+        L_greedy(t+1) = L_greedy(t+1) + loss(argmin(i));
+        fprintf('|%d| ', argmin(i));
+        clearvars min
+    end
+    for i = 1:k
+        loss_greedy(argmin(i)) = loss(argmin(i));
+    end
+    
+    if (sum(loss_greedy > 0.99) >= K-1)
+        loss_greedy = zeros(K,1);
+    end
+    
+    fprintf('\nBest:  TCL ');
+    argmin_b = zeros(k,1);  
+    loss_b = loss;
+    clearvars argmin_b
+    for i = 1:k
+        [min, argmin_b(i)] = min(loss_b);
+        tclCall_best(argmin_b(i)) = tclCall_best(argmin_b(i)) + 1;
+        loss_b(argmin_b(i)) = 1.2;
+        fprintf('|%d| ', argmin_b(i));
+        clearvars min
+    end
+    clearvars loss_b
+    fprintf('\n\n');
+    %% Plots
+    if (live_results == 1)
+        subplot(2,3,1);
+        plot((P/k)');
+        hold on;
+        grid on;
+        title('TCL probabilities');
+        ylabel('Probability');
+        xlabel('round');
+        legend(cellstr(num2str((1:1:K)', '%-d')), 'location', 'northwest');
+        xlim([0 t]);
+        hold off
+
+        j = 100;
+        if (mod(t,j) == 0 && t/j >= 1)
+            Lround_avg = zeros(t/j, 1);
+            Lround_var = zeros(t/j, 1);
+            min_loss_avg = zeros(t/j, 1);
+            for i = j:j:t
+                Lround_avg((i/j)) = mean(Lround(((i/j)-1)*j+1:i));
+                Lround_var((i/j)) = var(Lround(((i/j)-1)*j+1:i));
+                min_loss_avg((i/j)) = mean(min_loss(((i/j)-1)*j+1:i));
+            end
+
+            subplot(2,3,2);
+            errorbar(j:j:t, Lround_avg, Lround_var);
+            hold on
+            grid on;
+            plot(j:j:t, Lround_avg - min_loss_avg, 'm');
+            title('Round Loss');
+            ylabel('Loss');
+            xlabel('round');
+            legend('Round loss', 'Round regret', 'location', 'northwest');
+            xlim([0 t]);
+            hold off
+        end 
+
+        i = 0:t;
+        subplot(2,3,3);
+        plot(comm_L-Lmin);
+        hold on
+        grid on;
+        plot(L_greedy-Lmin, 'k');
+        title('Commulative Regret');
+        xlabel('round');
+        plot(2.63*sqrt(k*i*K*log(K/k)), 'r');
+        legend('Exp3.M Regret', 'Greedy Regret', 'Exp3.M Upper bound','location', 'northwest');
+        xlim([0 t]);
+        hold off
+
+        subplot(2,3,4);
+        bar(tclCall);
+        hold on;
+        grid on;
+        for i = 1:k
+            bar(S1(i), tclCall(S1(i)), 'facecolor', 'm');
+        end
+        title('TCLs histogram - Exp3.M');
+        ylabel('Times activated');
+        xlabel('TCL');
+        ylim([0 floor(max(tclCall)/20+1)*20])
+        hold off
+        
+        subplot(2,3,5);
+        bar(tclCall_greedy);
+        hold on;
+        grid on;
+        for i = 1:k
+            bar(argmin(i), tclCall_greedy(argmin(i)), 'facecolor', 'm');
+        end
+        title('TCLs histogram - Greedy');
+        ylabel('Times activated');
+        xlabel('TCL');
+        ylim([0 floor(max(tclCall_greedy)/20+1)*20])
+        hold off
+        
+        subplot(2,3,6);
+        bar(tclCall_best);
+        hold on;
+        grid on;
+        for i = 1:k
+            bar(argmin_b(i), tclCall_best(argmin_b(i)), 'facecolor', 'm');
+        end
+        title('TCLs histogram - Full Information');
+        ylabel('Times activated');
+        xlabel('TCL');
+        ylim([0 floor(max(tclCall_best)/20+1)*20])
+        hold off
+
+        refreshdata
+        drawnow
+    end
+ 
+end
